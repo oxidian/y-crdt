@@ -26,6 +26,15 @@ pub enum Any {
 }
 
 impl Any {
+    /// The deepest nesting of arrays and maps that [Any::decode] accepts. Deeper input fails with
+    /// [Error::UnexpectedValue].
+    ///
+    /// Decoding, encoding, comparing and dropping an [Any] all recurse once per level, so a value
+    /// nested too deeply overflows the stack, which aborts the process. Accepting it and running
+    /// the decoder on a bigger stack would not help, as the value would still have to be dropped
+    /// on an ordinary one.
+    pub const MAX_DECODE_DEPTH: usize = 256;
+
     #[inline]
     pub fn cast<T>(self) -> Result<T, Self>
     where
@@ -37,7 +46,15 @@ impl Any {
     }
 
     pub fn decode<R: Read>(decoder: &mut R) -> Result<Self, Error> {
-        Ok(match decoder.read_u8()? {
+        Self::decode_nested(decoder, 0)
+    }
+
+    fn decode_nested<R: Read>(decoder: &mut R, depth: usize) -> Result<Self, Error> {
+        let tag = decoder.read_u8()?;
+        if matches!(tag, 117 | 118) && depth >= Self::MAX_DECODE_DEPTH {
+            return Err(Error::UnexpectedValue);
+        }
+        Ok(match tag {
             // CASE 127: undefined
             127 => Any::Undefined,
             // CASE 126: null
@@ -68,7 +85,7 @@ impl Any {
                 map.try_reserve(len)?;
                 for _ in 0..len {
                     let key = decoder.read_string()?;
-                    map.insert(key.to_owned(), Any::decode(decoder)?);
+                    map.insert(key.to_owned(), Self::decode_nested(decoder, depth + 1)?);
                 }
                 Any::Map(Arc::new(map))
             }
@@ -80,7 +97,7 @@ impl Any {
                 let mut arr = Vec::new();
                 arr.try_reserve(len)?;
                 for _ in 0..len {
-                    arr.push(Any::decode(decoder)?);
+                    arr.push(Self::decode_nested(decoder, depth + 1)?);
                 }
                 Any::Array(Arc::from(arr))
             }
