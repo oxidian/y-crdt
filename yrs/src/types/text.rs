@@ -1,3 +1,4 @@
+use crate::any::NULL;
 use crate::block::{Block, EmbedPrelim, Item, ItemContent, ItemPosition, ItemPtr, Prelim, Unused};
 use crate::transaction::TransactionMut;
 use crate::types::{
@@ -504,7 +505,7 @@ where
         let (content, rest) = self.0.into_content(txn);
         match content {
             ItemContent::Any(mut any) if any.len() == 1 => match any.pop().unwrap() {
-                Any::String(str) => (ItemContent::String(str.as_ref().into()), None),
+                Any::String(ref str) => (ItemContent::String(str.as_ref().into()), None),
                 other => (ItemContent::Embed(other), None),
             },
             other => (other, rest.map(DeltaChunk)),
@@ -975,7 +976,7 @@ fn insert_attributes(
             .current_attrs
             .as_ref()
             .and_then(|a| a.get(&k))
-            .unwrap_or(&Any::Null);
+            .unwrap_or(&NULL);
         if &v != current_value {
             // save negated attribute (set null if currentVal undefined)
             negated_attrs.insert(k.clone(), current_value.clone());
@@ -1072,8 +1073,8 @@ fn clean_format_gap(
             let right = item.right.clone();
             if !item.is_deleted() {
                 if let ItemContent::Format(key, value) = &item.content {
-                    let e = end_attrs.get(key).unwrap_or(&Any::Null);
-                    let s = start_attrs.get(key).unwrap_or(&Any::Null);
+                    let e = end_attrs.get(key).unwrap_or(&NULL);
+                    let s = start_attrs.get(key).unwrap_or(&NULL);
                     if e != value.as_ref() || s == value.as_ref() {
                         txn.delete(start.unwrap());
                         cleanups += 1;
@@ -1390,7 +1391,7 @@ impl TextEvent {
                         }
                     } else if txn.has_deleted(&item.id) {
                         old_attrs.insert(key.clone(), value.clone());
-                        let current_val = asm.current_attrs.get(key).unwrap_or(&Any::Null);
+                        let current_val = asm.current_attrs.get(key).unwrap_or(&NULL);
                         if current_val != value.as_ref() {
                             let curr_val_clone = current_val.clone();
                             if asm.action == Some(Action::Retain) {

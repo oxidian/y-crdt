@@ -2,6 +2,7 @@ use crate::encoding::read::{Error, Read};
 use crate::encoding::write::Write;
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use smallvec::SmallVec;
 use std::cmp::PartialEq;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -10,6 +11,14 @@ use std::sync::Arc;
 
 pub const F64_MAX_SAFE_INTEGER: f64 = (i64::pow(2, 53) - 1) as f64;
 pub const F64_MIN_SAFE_INTEGER: f64 = -F64_MAX_SAFE_INTEGER;
+
+/// A null to lend where a value is missing, since [Any] implements [Drop] and so no `&Any::Null`
+/// lives past its statement.
+pub(crate) static NULL: Any = Any::Null;
+
+/// How many open arrays and maps the walks below hold before they move onto the heap, so a value
+/// of ordinary depth costs no allocation.
+const SHALLOW: usize = 8;
 
 /// Any is an enum with a potentially associated value that is used to represent JSON values
 /// and supports efficient encoding of those values.
@@ -25,16 +34,52 @@ pub enum Any {
     Map(Arc<HashMap<String, Any>>),
 }
 
-impl Any {
-    /// The deepest nesting of arrays and maps that [Any::decode] accepts. Deeper input fails with
-    /// [Error::UnexpectedValue].
-    ///
-    /// Decoding, encoding, comparing and dropping an [Any] all recurse once per level, so a value
-    /// nested too deeply overflows the stack, which aborts the process. Accepting it and running
-    /// the decoder on a bigger stack would not help, as the value would still have to be dropped
-    /// on an ordinary one.
-    pub const MAX_DECODE_DEPTH: usize = 256;
+/// An array or a map [Any::decode] has read the head of, with how many values it still holds, and
+/// for a map the key of the value read next.
+enum Decoding {
+    Array(Vec<Any>, usize),
+    Map(HashMap<String, Any>, usize, String),
+}
 
+impl Decoding {
+    /// Holds `value`, the value read next, and tells whether this still holds values to read.
+    fn holds_more_after(&mut self, value: Any) -> bool {
+        let remaining = match self {
+            Decoding::Array(items, remaining) => {
+                items.push(value);
+                remaining
+            }
+            Decoding::Map(entries, remaining, key) => {
+                entries.insert(std::mem::take(key), value);
+                remaining
+            }
+        };
+        *remaining -= 1;
+        *remaining > 0
+    }
+
+    fn take(&mut self) -> Any {
+        match self {
+            Decoding::Array(items, _) => Any::Array(Arc::from(std::mem::take(items))),
+            Decoding::Map(entries, _, _) => Any::Map(Arc::new(std::mem::take(entries))),
+        }
+    }
+}
+
+/// What [Any::decode] reads at a value's tag: the whole value, or the head of an array or a map
+/// whose values are still to read.
+enum Head {
+    Read(Any),
+    Opened(Decoding),
+}
+
+/// An array or a map [Any::encode] is writing, with the values it has still to write.
+enum Encoding<'a> {
+    Array(std::slice::Iter<'a, Any>),
+    Map(std::collections::hash_map::Iter<'a, String, Any>),
+}
+
+impl Any {
     #[inline]
     pub fn cast<T>(self) -> Result<T, Self>
     where
@@ -46,15 +91,33 @@ impl Any {
     }
 
     pub fn decode<R: Read>(decoder: &mut R) -> Result<Self, Error> {
-        Self::decode_nested(decoder, 0)
+        // Arrays and maps nest as deep as their bytes run, so the ones still being read are kept
+        // here rather than on the native stack, which a deep enough value would overflow.
+        let mut open: SmallVec<[Decoding; SHALLOW]> = SmallVec::new();
+        'values: loop {
+            if let Some(Decoding::Map(_, _, key)) = open.last_mut() {
+                *key = decoder.read_string()?.to_owned();
+            }
+            let mut value = match Self::decode_head(decoder)? {
+                Head::Read(value) => value,
+                Head::Opened(container) => {
+                    open.push(container);
+                    continue;
+                }
+            };
+            while let Some(container) = open.last_mut() {
+                if container.holds_more_after(value) {
+                    continue 'values;
+                }
+                value = container.take();
+                open.pop();
+            }
+            return Ok(value);
+        }
     }
 
-    fn decode_nested<R: Read>(decoder: &mut R, depth: usize) -> Result<Self, Error> {
-        let tag = decoder.read_u8()?;
-        if matches!(tag, 117 | 118) && depth >= Self::MAX_DECODE_DEPTH {
-            return Err(Error::UnexpectedValue);
-        }
-        Ok(match tag {
+    fn decode_head<R: Read>(decoder: &mut R) -> Result<Head, Error> {
+        Ok(Head::Read(match decoder.read_u8()? {
             // CASE 127: undefined
             127 => Any::Undefined,
             // CASE 126: null
@@ -83,9 +146,8 @@ impl Any {
                 // (see `Update::decode`'s `try_reserve`).
                 let mut map = HashMap::new();
                 map.try_reserve(len)?;
-                for _ in 0..len {
-                    let key = decoder.read_string()?;
-                    map.insert(key.to_owned(), Self::decode_nested(decoder, depth + 1)?);
+                if len > 0 {
+                    return Ok(Head::Opened(Decoding::Map(map, len, String::new())));
                 }
                 Any::Map(Arc::new(map))
             }
@@ -96,15 +158,15 @@ impl Any {
                 // (see `Update::decode`'s `try_reserve`).
                 let mut arr = Vec::new();
                 arr.try_reserve(len)?;
-                for _ in 0..len {
-                    arr.push(Self::decode_nested(decoder, depth + 1)?);
+                if len > 0 {
+                    return Ok(Head::Opened(Decoding::Array(arr, len)));
                 }
                 Any::Array(Arc::from(arr))
             }
             // CASE 116: buffer
             116 => Any::Buffer(Arc::from(decoder.read_buf()?)),
             _ => return Err(Error::UnexpectedValue),
-        })
+        }))
     }
 
     // Encode data with efficient binary format.
@@ -140,6 +202,35 @@ impl Any {
     // [31-127] the end of the data range is used for data encoding by
     //          lib0/encoding.js
     pub fn encode<W: Write>(&self, encoder: &mut W) {
+        // As in decoding, the arrays and maps still being written are kept here rather than on the
+        // native stack.
+        let mut open: SmallVec<[Encoding<'_>; SHALLOW]> = SmallVec::new();
+        let mut next = Some(self);
+        while let Some(value) = next {
+            if let Some(container) = value.encode_head(encoder) {
+                open.push(container);
+            }
+            next = loop {
+                let Some(container) = open.last_mut() else {
+                    break None;
+                };
+                let value = match container {
+                    Encoding::Array(items) => items.next(),
+                    Encoding::Map(entries) => entries.next().map(|(key, value)| {
+                        encoder.write_string(key);
+                        value
+                    }),
+                };
+                if value.is_some() {
+                    break value;
+                }
+                open.pop();
+            };
+        }
+    }
+
+    /// Writes this value, or for an array or a map its head, handing back the values it holds.
+    fn encode_head<W: Write>(&self, encoder: &mut W) -> Option<Encoding<'_>> {
         match self {
             Any::Undefined => {
                 // TYPE 127: undefined
@@ -197,18 +288,13 @@ impl Any {
                 // TYPE 117: Array
                 encoder.write_u8(117);
                 encoder.write_var(arr.len() as u64);
-                for el in arr.iter() {
-                    el.encode(encoder);
-                }
+                return Some(Encoding::Array(arr.iter()));
             }
             Any::Map(map) => {
                 // TYPE 118: Map
                 encoder.write_u8(118);
                 encoder.write_var(map.len() as u64);
-                for (key, value) in map.as_ref() {
-                    encoder.write_string(&key);
-                    value.encode(encoder);
-                }
+                return Some(Encoding::Map(map.iter()));
             }
             Any::Buffer(buf) => {
                 // TYPE 116: Buffer
@@ -216,6 +302,7 @@ impl Any {
                 encoder.write_buf(&buf)
             }
         }
+        None
     }
 
     pub fn from_json(src: &str) -> Result<Self, Error> {
@@ -243,10 +330,79 @@ impl Any {
     }
 
     pub fn try_into_iter(self) -> Option<AnyIntoIter> {
-        match self {
+        match &self {
             Any::Array(values) => Some(AnyIntoIter::from(values.clone())),
             Any::Map(entries) => Some(AnyIntoIter::from(entries.clone())),
             _ => None,
+        }
+    }
+}
+
+impl Drop for Any {
+    fn drop(&mut self) {
+        // Dropping an array or a map drops every value inside it, a level at a time on the native
+        // stack, so the ones nested inside others are dropped from here, `DROP_DEPTH` levels at a
+        // time.
+        if !self.holds_a_container() {
+            return;
+        }
+        let mut deeper = Vec::new();
+        self.drop_nested(DROP_DEPTH, &mut deeper);
+        while let Some(mut value) = deeper.pop() {
+            value.drop_nested(DROP_DEPTH, &mut deeper);
+        }
+    }
+}
+
+/// How many levels of nested arrays and maps dropping an [Any] recurses into.
+const DROP_DEPTH: usize = 64;
+
+impl Any {
+    fn is_container(&self) -> bool {
+        matches!(self, Any::Array(_) | Any::Map(_))
+    }
+
+    fn holds_a_container(&self) -> bool {
+        match self {
+            Any::Array(items) => items.iter().any(Any::is_container),
+            Any::Map(entries) => entries.values().any(Any::is_container),
+            _ => false,
+        }
+    }
+
+    /// Drops, where nothing else holds this one, every array or map inside it that holds another,
+    /// leaving a null in its place: those within `levels` levels here, and deeper ones by handing
+    /// them to `deeper`. One holding no other is left to its own drop, which recurses no further.
+    fn drop_nested(&mut self, levels: usize, deeper: &mut Vec<Any>) {
+        match self {
+            Any::Array(items) => {
+                if let Some(items) = Arc::get_mut(items) {
+                    Self::drop_containers(items.iter_mut(), levels, deeper);
+                }
+            }
+            Any::Map(entries) => {
+                if let Some(entries) = Arc::get_mut(entries) {
+                    Self::drop_containers(entries.values_mut(), levels, deeper);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn drop_containers<'a>(
+        values: impl Iterator<Item = &'a mut Any>,
+        levels: usize,
+        deeper: &mut Vec<Any>,
+    ) {
+        for value in values {
+            if value.holds_a_container() {
+                let mut nested = std::mem::replace(value, Any::Null);
+                if levels == 0 {
+                    deeper.push(nested);
+                } else {
+                    nested.drop_nested(levels - 1, deeper);
+                }
+            }
         }
     }
 }
@@ -684,7 +840,7 @@ impl TryFrom<Any> for String {
 
     fn try_from(v: Any) -> Result<Self, Self::Error> {
         match v {
-            Any::String(value) => Ok(String::from(value.as_ref())),
+            Any::String(ref value) => Ok(String::from(value.as_ref())),
             other => Err(other),
         }
     }
@@ -709,7 +865,7 @@ impl TryFrom<Any> for Arc<str> {
 
     fn try_from(v: Any) -> Result<Self, Self::Error> {
         match v {
-            Any::String(value) => Ok(value),
+            Any::String(ref value) => Ok(value.clone()),
             other => Err(other),
         }
     }
@@ -727,7 +883,7 @@ impl TryFrom<Any> for Vec<u8> {
 
     fn try_from(v: Any) -> Result<Self, Self::Error> {
         match v {
-            Any::Buffer(value) => Ok(Vec::from(value.as_ref())),
+            Any::Buffer(ref value) => Ok(Vec::from(value.as_ref())),
             other => Err(other),
         }
     }
@@ -745,7 +901,7 @@ impl TryFrom<Any> for Arc<[u8]> {
 
     fn try_from(v: Any) -> Result<Self, Self::Error> {
         match v {
-            Any::Buffer(value) => Ok(value),
+            Any::Buffer(ref value) => Ok(value.clone()),
             other => Err(other),
         }
     }

@@ -1650,7 +1650,7 @@ pub unsafe extern "C" fn ydelta_input_insert(
 }
 
 fn map_attrs(attrs: Any) -> Option<Attrs> {
-    if let Any::Map(attrs) = attrs {
+    if let Any::Map(attrs) = &attrs {
         let attrs = attrs
             .iter()
             .map(|(k, v)| (k.as_str().into(), v.clone()))
@@ -3317,18 +3317,7 @@ impl<'a> From<&'a Any> for YOutput {
 
 impl From<Any> for YOutput {
     fn from(v: Any) -> Self {
-        unsafe {
-            match v {
-                Any::Null => YOutput::null(),
-                Any::Undefined => YOutput::undefined(),
-                Any::Bool(v) => YOutput::from(v),
-                Any::Number(v) => YOutput::from(v),
-                Any::String(v) => YOutput::from(v.as_ref()),
-                Any::Buffer(v) => YOutput::from(v.as_ref()),
-                Any::Array(v) => YOutput::from(v.as_ref()),
-                Any::Map(v) => YOutput::from(v.as_ref()),
-            }
-        }
+        YOutput::from(&v)
     }
 }
 

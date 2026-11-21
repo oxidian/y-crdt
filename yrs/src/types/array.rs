@@ -1109,7 +1109,7 @@ mod test {
                 .map(|_| Any::from(unique_number))
                 .collect();
             let mut pos = rng.between(0, yarray.len(&txn)) as usize;
-            if let Any::Array(expected) = yarray.to_json(&txn) {
+            if let Any::Array(ref expected) = yarray.to_json(&txn) {
                 let mut expected = Vec::from(expected.as_ref());
                 yarray.insert_range(&mut txn, pos as u32, content.clone());
 
@@ -1157,7 +1157,7 @@ mod test {
                         array2.remove_range(&mut txn, pos, del_len);
                     }
                 } else {
-                    if let Any::Array(old_content) = yarray.to_json(&txn) {
+                    if let Any::Array(ref old_content) = yarray.to_json(&txn) {
                         let mut old_content = Vec::from(old_content.as_ref());
                         yarray.remove_range(&mut txn, pos, del_len);
                         old_content.drain(pos as usize..(pos + del_len) as usize);

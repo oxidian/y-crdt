@@ -589,7 +589,7 @@ impl Decode for Options {
         let guid = decoder.read_string()?;
         options.guid = guid.into();
 
-        if let Any::Map(opts) = decoder.read_any()? {
+        if let Any::Map(opts) = &decoder.read_any()? {
             for (k, v) in opts.iter() {
                 match (k.as_str(), v) {
                     ("gc", Any::Bool(gc)) => options.skip_gc = !*gc,

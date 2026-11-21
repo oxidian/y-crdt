@@ -364,7 +364,7 @@ impl SerializeMap for AnyMapSerializer {
         T: Serialize,
     {
         self.next_key = Some(match key.serialize(AnySerializer)? {
-            Any::String(s) => s.to_string(),
+            Any::String(ref s) => s.to_string(),
             _ => return Err(AnySerializeError::MapKeyNotString),
         });
         Ok(())

@@ -53,8 +53,8 @@ fn slice_iter<'a, T: ReadTxn>(
     by: usize,
 ) -> Option<Box<dyn Iterator<Item = Out> + 'a>> {
     match value {
-        Some(Out::Any(Any::Array(array))) => {
-            let iter = AnyArrayIter::new(array);
+        Some(Out::Any(Any::Array(ref array))) => {
+            let iter = AnyArrayIter::new(array.clone());
             Some(Box::new(
                 iter.skip(from).take(to - from).step_by(by).map(Out::Any),
             ))
@@ -121,7 +121,8 @@ fn member_union_iter<'a, T: ReadTxn>(
     members: &'a [&'a str],
 ) -> Option<Box<dyn Iterator<Item = Out> + 'a>> {
     match value {
-        Some(Out::Any(Any::Map(map))) => {
+        Some(Out::Any(Any::Map(ref map))) => {
+            let map = map.clone();
             let iter = members
                 .into_iter()
                 .flat_map(move |key| map.get(*key).cloned().map(Out::Any));
@@ -145,7 +146,8 @@ fn index_union_iter<'a, T: ReadTxn>(
     indices: &'a [i32],
 ) -> Option<Box<dyn Iterator<Item = Out> + 'a>> {
     match value {
-        Some(Out::Any(Any::Array(array))) => {
+        Some(Out::Any(Any::Array(ref array))) => {
+            let array = array.clone();
             let iter = indices.into_iter().flat_map(move |i| {
                 let i = if *i < 0 {
                     (array.len() as i32 + *i) as usize

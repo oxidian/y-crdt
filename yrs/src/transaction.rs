@@ -1,3 +1,4 @@
+use crate::any::NULL;
 use crate::block::{Block, BlockRange, Item, ItemContent, ItemPosition, ItemPtr, Prelim, ID};
 use crate::branch::{Branch, BranchPtr};
 use crate::doc::DocAddr;
@@ -1336,7 +1337,7 @@ impl<'doc> TransactionMut<'doc> {
             if !startp.is_deleted() {
                 if let ItemContent::Format(key, attr) = &startp.content {
                     let value = &**attr;
-                    let start_attr_value = start_attrs.get(key).map_or(&Any::Null, |a| &**a);
+                    let start_attr_value = start_attrs.get(key).map_or(&NULL, |a| &**a);
                     if end_fmts.get(key) != Some(&startp) || start_attr_value == value {
                         // Either this format is overwritten or it is not necessary because the attribute already existed.
                         self.delete(startp);
@@ -1344,7 +1345,7 @@ impl<'doc> TransactionMut<'doc> {
                         cleanups += 1;
 
                         if !reached_curr
-                            && curr_attrs.get(key).map_or(&Any::Null, |a| &**a) == value
+                            && curr_attrs.get(key).map_or(&NULL, |a| &**a) == value
                             && start_attr_value != value
                         {
                             if value == &Any::Null {
